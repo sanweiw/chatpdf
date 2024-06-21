@@ -1,0 +1,257 @@
+from flask import Flask, jsonify, request
+from werkzeug.utils import secure_filename
+from tempfile import NamedTemporaryFile
+import hashlib
+import shutil  
+import os
+from flask_cors import CORS
+from pdf_utils import extract_text_from_pdf
+from openai import OpenAI
+from dotenv import load_dotenv, find_dotenv
+_ = load_dotenv(find_dotenv())  # 读取本地 .env 文件，里面定义了 OPENAI_API_KEY
+
+client = OpenAI()
+
+__import__('pysqlite3')
+import sys
+
+sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+
+
+class MyVectorDBConnector:
+    def __init__(self, collection_name, embedding_fn):
+        chroma_client = chromadb.Client(Settings(allow_reset=True))
+
+        # 为了演示，实际不需要每次 reset()
+        chroma_client.reset()
+
+        # 创建一个 collection
+        self.collection = chroma_client.get_or_create_collection(
+            name=collection_name)
+        self.embedding_fn = embedding_fn
+
+    def add_documents(self, documents):
+        '''向 collection 中添加文档与向量'''
+        self.collection.add(
+            embeddings=self.embedding_fn(documents),  # 每个文档的向量
+            documents=documents,  # 文档的原文
+            ids=[f"id{i}" for i in range(len(documents))]  # 每个文档的 id
+        )
+
+    def search(self, query, top_n):
+        '''检索向量数据库'''
+        results = self.collection.query(
+            query_embeddings=self.embedding_fn([query]),
+            n_results=top_n
+        )
+        return results
+    
+
+class RAG_Bot:
+    def __init__(self, vector_db, llm_api, n_results=2):
+        self.vector_db = vector_db
+        self.llm_api = llm_api
+        self.n_results = n_results
+
+    def chat(self, user_query):
+        # 1. 检索
+        search_results = self.vector_db.search(user_query, self.n_results)
+
+        # 2. 构建 Prompt
+        prompt = build_prompt(
+            prompt_template, context=search_results['documents'][0], query=user_query)
+
+        # 3. 调用 LLM
+        response = self.llm_api(prompt)
+        return response
+        
+
+app = Flask(__name__)
+# 允许所有来源，允许跨域请求携带 cookies（可选），允许所有默认方法（包括 OPTIONS）
+CORS(app, supports_credentials=True, resources={r"/*": {"origins": "*"}})
+
+
+# 设置上传文件的保存目录
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'pdf'}
+
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['initialized'] = False
+
+
+def add_documents_to_vector_db():
+    for filename in os.listdir(app.config['UPLOAD_FOLDER']):
+        print("add_documents_to_vector_db:"+filename)
+        if filename.endswith('.pdf'):
+            print("1")
+            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            print("file_path:"+file_path)
+            paragraphs = extract_text_from_pdf(file_path, min_line_length=10)
+            print("2")
+            vector_db.add_documents(paragraphs)
+            print("3")
+    print("All documents have been added to the vector database.")
+
+
+# @app.before_first_request
+#@app.before_request
+def initialize_vector_db():
+    if not app.config['initialized']:
+        print('enter initialize_vector_db')
+        add_documents_to_vector_db()
+        app.config['initialized'] = True
+
+
+# 检查文件扩展名是否允许
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+# def file_hash(file_path):
+#     """计算文件的SHA256哈希值"""
+#     sha256_hash = hashlib.sha256()
+#     with open(file_path, "rb") as f:
+#         # 读取并更新哈希字符串的值
+#         for byte_block in iter(lambda: f.read(4096), b""):
+#             sha256_hash.update(byte_block)
+        
+#     return sha256_hash.hexdigest()
+
+def file_hash(file_stream):
+    """计算文件流的SHA256哈希值"""
+    sha256_hash = hashlib.sha256()
+    # 读取并更新哈希字符串的值
+    for byte_block in iter(lambda: file_stream.read(4096), b""):
+        sha256_hash.update(byte_block)
+    file_stream.seek(0)  # 重置文件流的位置
+    return sha256_hash.hexdigest()
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    print("enter upload_file")
+    # 检查是否有文件在请求中
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+    file = request.files['file']
+    # 如果用户没有选择文件，浏览器也会提交一个空的文件名
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+    if file and allowed_file(file.filename):
+
+        # 使用临时文件计算哈希值
+        with NamedTemporaryFile(delete=False) as tmp_file:
+            file.save(tmp_file)
+            tmp_file.seek(0)  # 回到文件开头，以便重新读取内容进行哈希计算
+            file_hash_value = file_hash(tmp_file)
+
+        hash_file_path = os.path.join(app.config['UPLOAD_FOLDER'], 'hashes.txt')
+        if os.path.exists(hash_file_path):
+            with open(hash_file_path, 'r') as hash_file:
+                if file_hash_value in hash_file.read():
+                    os.remove(tmp_file.name)  # 删除临时文件
+                    return jsonify({'message': 'File already exists'}), 200
+
+        # 文件是新的，移动到最终目录
+        final_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file.filename))
+        # os.rename(tmp_file.name, final_path)
+        shutil.move(tmp_file.name, final_path)  # 使用shutil.move代替os.rename
+
+        with open(hash_file_path, 'a') as hash_file:
+            hash_file.write(file_hash_value + '\n')
+
+        # 在这里调用extract_text_from_pdf函数处理上传的PDF文件
+        paragraphs = extract_text_from_pdf(final_path, min_line_length=10)
+
+        # 向向量数据库中添加文档
+        vector_db.add_documents(paragraphs)
+
+        return jsonify({'message': 'File saved'}), 200
+    else:
+        return jsonify({'error': 'File type not allowed'}), 400
+
+    
+@app.route('/process-input', methods=['POST'])
+def process_input():
+    # 获取 JSON 数据
+    data = request.json
+    input_text = data.get('input_text')
+    # results = vector_db.search(input_text, top_n=2) 
+
+    # for para in results['documents'][0]:
+    #     print(para+"\n")
+    print(input_text)
+    response = bot.chat(input_text)
+    print(response)
+    return jsonify({'message': response}), 200
+
+    # 返回成功的响应
+    #return jsonify({'message': 'Input processed successfully'}), 200    
+
+
+def get_embeddings(texts, model="text-embedding-ada-002", dimensions=None):
+    '''封装 OpenAI 的 Embedding 模型接口'''
+    if model == "text-embedding-ada-002":
+        dimensions = None
+    if dimensions:
+        data = client.embeddings.create(
+            input=texts, model=model, dimensions=dimensions).data
+    else:
+        data = client.embeddings.create(input=texts, model=model).data
+    print(len(data))
+    return [x.embedding for x in data]
+
+
+prompt_template = """
+你是一个问答机器人。
+你的任务是根据下述给定的已知信息回答用户问题。
+
+已知信息:
+{context}
+
+用户问：
+{query}
+
+如果已知信息不包含用户问题的答案，或者已知信息不足以回答用户的问题，请直接回复"我无法回答您的问题"。
+请不要输出已知信息中不包含的信息或答案。
+请用中文回答用户问题。
+"""
+
+def build_prompt(prompt_template, **kwargs):
+    '''将 Prompt 模板赋值'''
+    inputs = {}
+    for k, v in kwargs.items():
+        if isinstance(v, list) and all(isinstance(elem, str) for elem in v):
+            val = '\n\n'.join(v)
+        else:
+            val = v
+        inputs[k] = val
+    return prompt_template.format(**inputs)
+
+
+def get_completion(prompt, model="gpt-3.5-turbo-1106"):
+    '''封装 openai 接口'''
+    messages = [{"role": "user", "content": prompt}]
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0,  # 模型输出的随机性，0 表示随机性最小
+    )
+    return response.choices[0].message.content
+
+
+
+import chromadb
+from chromadb.config import Settings
+
+# 创建一个向量数据库对象
+vector_db = MyVectorDBConnector("demo", get_embeddings)
+
+# 创建一个RAG机器人
+bot = RAG_Bot(
+    vector_db,
+    llm_api=get_completion
+)
+
+
+if __name__ == '__main__':
+    app.run(debug=True)
